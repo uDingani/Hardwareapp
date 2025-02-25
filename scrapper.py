@@ -1,9 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Created on Fri Feb 21 21:03:49 2025
-
-@author: Busiso
-"""
 import requests
 from bs4 import BeautifulSoup
 import csv
@@ -30,6 +25,7 @@ def check_robots(base_url):
     rp.set_url(urljoin(base_url, '/robots.txt'))
     try:
         rp.read()
+        print(f"Successfully read robots.txt from {base_url}")
     except Exception as e:
         print(f"Error reading robots.txt: {e}")
         return None
@@ -38,11 +34,13 @@ def check_robots(base_url):
 def can_fetch(rp, url):
     if rp is None:
         return True
-    return rp.can_fetch(get_random_user_agent(), url)
+    allowed = rp.can_fetch(get_random_user_agent(), url)
+    print(f"Can fetch {url}: {allowed}")
+    return allowed
 
 def scrape_product_details(product_url, rp):
-    if rp and not can_fetch(rp, product_url):
-        print(f"Not allowed to scrape {product_url} per robots.txt")
+    if not can_fetch(rp, product_url):
+        print(f"Blocked by robots.txt: {product_url}")
         return "N/A"
 
     try:
@@ -51,22 +49,24 @@ def scrape_product_details(product_url, rp):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        # Look for description (common Magento locations)
+        # Broaden description search
         desc = (soup.find('div', class_='product-description') or
                 soup.find('div', class_='description') or
                 soup.find('div', class_='product-attribute-overview') or
-                soup.find('div', id='description'))
-        desc_text = desc.get_text(strip=True) if desc else "N/A"
-
+                soup.find('div', id='description') or
+                soup.find('div', class_='product-details') or  # Added fallback
+                soup.find('meta', attrs={'name': 'description'}))  # Fallback to meta tag
+        desc_text = desc.get_text(strip=True) if desc and hasattr(desc, 'get_text') else desc['content'] if desc else "N/A"
+        print(f"Description for {product_url}: {desc_text[:50]}...")  # Log snippet
         return desc_text
 
     except requests.RequestException as e:
-        print(f"Error fetching product page {product_url}: {e}")
+        print(f"Error fetching {product_url}: {e}")
         return "N/A"
 
 def scrape_products_from_page(url, rp):
-    if rp and not can_fetch(rp, url):
-        print(f"Not allowed to scrape {url} per robots.txt")
+    if not can_fetch(rp, url):
+        print(f"Blocked by robots.txt: {url}")
         return [], None
 
     try:
@@ -79,59 +79,47 @@ def scrape_products_from_page(url, rp):
                              soup.find('ul', class_='products-grid') or
                              soup.find('div', class_='product-items'))
         if not product_container:
-            print(f"No product container on {url}. Dumping to 'page_debug.html'")
+            print(f"No product container on {url}. Dumping HTML.")
             with open('page_debug.html', 'w', encoding='utf-8') as f:
                 f.write(soup.prettify())
             return [], None
 
-        products = product_container.find_all('li', class_='product')
+        products = product_container.find_all('li', class_='product') or product_container.find_all('div', class_='product')  # Broaden search
         if not products:
-            print(f"No 'li.product' found on {url}. Container HTML:")
+            print(f"No products found on {url}. Container HTML:")
             print(product_container.prettify()[:2000])
             return [], None
 
         inventory = []
-        for i, product in enumerate(products, 1):
-            html_snippet = product.prettify()[:1500]
-            print(f"Product {i} HTML from {url}:\n{html_snippet}")
+        for product in products:
+            details = product.find('div', class_='product-item-details') or product  # Fallback to product itself
+            name = details.find('a', class_='product-item-link') or details.find('a')
+            name_text = name.get_text(strip=True) if name else "N/A"
+            product_url = name['href'] if name and 'href' in name.attrs else url
 
-            details = product.find('div', class_='product-item-details')
-            if details:
-                name = details.find('a', class_='product-item-link')
-                name_text = name.get_text(strip=True) if name else "N/A"
-                product_url = name['href'] if name and 'href' in name.attrs else url
+            price_box = details.find('span', class_='price-wrapper') or details.find('span', class_='price')
+            price_text = (price_box.find('span', class_='price').get_text(strip=True) if price_box and price_box.find('span', class_='price')
+                          else price_box['data-price-amount'] if price_box and 'data-price-amount' in price_box.attrs else "N/A")
+            if price_text != "N/A" and not price_text.startswith('USD'):
+                price_text = f"USD {price_text}"
 
-                price_box = details.find('span', class_='price-wrapper')
-                price_text = (price_box.find('span', class_='price').get_text(strip=True) if price_box and price_box.find('span', class_='price')
-                              else price_box['data-price-amount'] if price_box and 'data-price-amount' in price_box.attrs else "N/A")
-                if price_text != "N/A" and not price_text.startswith('USD'):
-                    price_text = f"USD {price_text}"
+            stock = details.find('span', class_=lambda x: x and 'stock' in x) or details.find('p', class_='stock')
+            stock_text = stock.get_text(strip=True) if stock else "Unknown"
 
-                stock = (details.find('span', class_=lambda x: x and 'stock' in x) or
-                         details.find('p', class_='stock') or
-                         product.find('div', class_='stock'))
-                stock_text = stock.get_text(strip=True) if stock else "Unknown"
-
-                # Scrape description from product page
-                desc_text = scrape_product_details(product_url, rp) if name_text != "N/A" else "N/A"
-            else:
-                name_text, price_text, stock_text, desc_text, product_url = "N/A", "N/A", "Unknown", "N/A", url
+            desc_text = scrape_product_details(product_url, rp) if name_text != "N/A" else "N/A"
 
             if name_text != "N/A":
                 inventory.append({
                     "Name": name_text,
                     "Price": price_text,
                     "Stock": stock_text,
-                    "URL": product_url,  # Use product-specific URL
+                    "URL": product_url,
                     "Description": desc_text
                 })
 
-        next_link = soup.find('a', class_='next')
-        next_url = next_link['href'] if next_link and 'href' in next_link.attrs else None
-        if next_url and not next_url.startswith('http'):
-            next_url = urljoin(url, next_url)
-        print(f"Next page URL: {next_url}")
-
+        next_link = soup.find('a', class_='next') or soup.find('a', rel='next')
+        next_url = urljoin(url, next_link['href']) if next_link and 'href' in next_link.attrs else None
+        print(f"Found {len(inventory)} products on {url}. Next page: {next_url}")
         return inventory, next_url
 
     except requests.RequestException as e:
@@ -141,20 +129,18 @@ def scrape_products_from_page(url, rp):
 def scrape_category(url, base_url, rp):
     all_inventory = []
     current_url = url
-
     while current_url:
-        print(f"Scraping category page: {current_url}")
+        print(f"Scraping: {current_url}")
         page_inventory, next_url = scrape_products_from_page(current_url, rp)
         all_inventory.extend(page_inventory)
         current_url = next_url
         time.sleep(random.uniform(2, 5))
-
     return all_inventory
 
 def scrape_site(start_url):
     rp = check_robots(start_url)
-    if rp and not can_fetch(rp, start_url):
-        print(f"Not allowed to scrape {start_url} per robots.txt")
+    if not can_fetch(rp, start_url):
+        print(f"Blocked by robots.txt: {start_url}")
         return []
 
     try:
@@ -171,34 +157,35 @@ def scrape_site(start_url):
                 category_links.add(full_url)
 
         if not category_links:
-            print("No category links found! Dumping to 'debug.html'")
+            print("No categories found. Dumping HTML.")
             with open('debug.html', 'w', encoding='utf-8') as f:
                 f.write(soup.prettify())
             return []
 
-        print(f"Found {len(category_links)} category/store links: {list(category_links)[:5]}...")
+        print(f"Found {len(category_links)} categories: {list(category_links)[:5]}...")
         all_inventory = []
-        for i, cat_url in enumerate(category_links, 1):
-            print(f"Processing category {i}/{len(category_links)}: {cat_url}")
-            cat_inventory = scrape_category(cat_url, start_url, rp)
-            all_inventory.extend(cat_inventory)
-
+        for cat_url in category_links:
+            all_inventory.extend(scrape_category(cat_url, start_url, rp))
+        print(f"Total products scraped: {len(all_inventory)}")
         return all_inventory
 
     except requests.RequestException as e:
-        print(f"Error fetching homepage {start_url}: {e}")
+        print(f"Error fetching {start_url}: {e}")
         return []
 
 def save_to_csv(data, filename="full_inventory.csv"):
     if not data:
-        print("No data to save.")
+        print("No data to save!")
         return
     keys = data[0].keys()
-    with open(filename, 'w', newline='', encoding='utf-8') as file:
-        writer = csv.DictWriter(file, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(data)
-    print(f"Data saved to {filename}")
+    try:
+        with open(filename, 'w', newline='', encoding='utf-8') as file:
+            writer = csv.DictWriter(file, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(data)
+        print(f"Saved {len(data)} items to {filename}")
+    except Exception as e:
+        print(f"Error saving CSV: {e}")
 
 if __name__ == "__main__":
     start_url = input("Enter the homepage URL to scrape (e.g., https://halsteds.co.zw/): ").strip()
@@ -207,8 +194,8 @@ if __name__ == "__main__":
     else:
         inventory_data = scrape_site(start_url)
         if inventory_data:
-            for item in inventory_data:
-                print(f"Product: {item['Name']}, Price: {item['Price']}, Stock: {item['Stock']}, URL: {item['URL']}, Description: {item['Description']}")
+            for item in inventory_data[:5]:  # Show first 5 for brevity
+                print(f"Product: {item['Name']}, Price: {item['Price']}, Description: {item['Description'][:50]}...")
             save_to_csv(inventory_data)
         else:
             print("No inventory data retrieved.")
